@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+numpy
+scipy
+pydantic
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
+cors
