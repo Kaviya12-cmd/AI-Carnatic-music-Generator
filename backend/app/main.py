@@ -1,16 +1,28 @@
-from fastapi import FastAPI, Depends, HTTPException, Body
-from fastapi.responses import StreamingResponse
+"""
+main.py – FastAPI Dispatcher for Carnatic AI
+============================================
+Updates:
+1. 3-mode lyrics/notation parser (Western, Swara, Syllable).
+2. Keyboard note mapping with Just Intonation.
+3. Rounded frequency and keyboard note in display notation.
+"""
+
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
-import random
-import io
+import base64
+import math
 
 from .auth import router as auth_router, get_current_user
-from .music_theory import RAGAM_DB, TALAM_DB, get_freq
-from .audio_engine import ViolinSynthesizer, Note
+from .music_theory import (
+    RAGAM_DB, TALAM_DB, PITCH_FREQ_MAP, DEFAULT_BASE_FREQ, 
+    get_freq, ragam_validation, pitch_validation
+)
+from .audio_engine import CarnaticSynthesizer, Note
+from .ragam_generator import get_sarali_varisai, generate_full_ascent_descent, generate_ragam_melody
 
-app = FastAPI(title="Carnatic AI Generator")
+app = FastAPI(title="Carnatic AI Generator - DSP Optimized")
 
 app.add_middleware(
     CORSMiddleware,
@@ -23,331 +35,213 @@ app.add_middleware(
 app.include_router(auth_router)
 
 class GenerationRequest(BaseModel):
-    lyrics: str
     ragam: str
-    talam: str
-    gamaka_style: str  # Kampitam, Jaru, Nokku, None
-    instrument: Optional[str] = "Violin" # Violin, Voice
-    pitch: Optional[float] = 261.63 # Default C4
+    pitch_name: str
+    tempo: int
+    lyrics: Optional[str] = ""
+    talam: Optional[str] = "Adi"
+    sarali_index: Optional[int] = 1 # 1-4
+    use_sarali: Optional[bool] = True
+    instrument: Optional[str] = "Violin"
+
+def parse_lyrics_to_swaras(text: str, ragam_name: str) -> List[tuple]:
+    """
+    Fix 1: 3-mode parser
+    Mode 1: Western notes (C D E F G A B C') → convert to ragam swaras
+    Mode 2: Swara names (S R G M P D N S') → map to ragam-correct swaras  
+    Mode 3: Any syllables (Tamil/solkattu) → assign scale-order notes
+    Also: strip | and || bar lines before parsing
+    """
+    # Strip | and || bar lines
+    text = text.replace("||", "").replace("|", "")
+    tokens = text.split("-") if "-" in text else text.split()
+    
+    ragam_info = RAGAM_DB.get(ragam_name)
+    if not ragam_info:
+        return []
+
+    swara_types = ragam_info["swara_types"]
+    
+    # Indices for mapping
+    WESTERN_MAP = {"C": 0, "D": 1, "E": 2, "F": 3, "G": 4, "A": 5, "B": 6}
+    CARNATIC_MAP = {"S": 0, "R": 1, "G": 2, "M": 3, "P": 4, "D": 5, "N": 6}
+    
+    results = []
+    current_octave = 0
+    prev_idx = -1
+
+    for token in tokens:
+        clean = token.replace("'", "").replace("_", "").upper()
+        
+        # Mode 2 & 1: Check for known note names (Carnatic priority)
+        base_idx = -1
+        if clean in CARNATIC_MAP:
+            base_idx = CARNATIC_MAP[clean]
+        elif clean in WESTERN_MAP:
+            base_idx = WESTERN_MAP[clean]
+            
+        if base_idx != -1:
+            # Stateful Octave Tracking (Fix: S R G M P D N S -> S')
+            if prev_idx != -1:
+                # If we wrap around transition (N -> S or D -> S), increment octave
+                if base_idx < prev_idx and (prev_idx - base_idx) >= 4:
+                    current_octave += 1
+                # If we drop down (S -> N), decrement octave
+                elif base_idx > prev_idx and (base_idx - prev_idx) >= 4:
+                    current_octave -= 1
+            
+            # Reset/Override octave if explicit markers are present
+            marks = token.count("'") - token.count("_")
+            # If explicit marks exist, we could reset current_octave, but 
+            # for now we combine them to handle S' vs S
+            final_octave = current_octave + marks
+            
+            # Map index to ragam swara type
+            mapped = swara_types[base_idx % len(swara_types)]
+            
+            # Apply octave markers to mapped swara
+            if final_octave > 0:
+                mapped = mapped.replace("'", "").replace("_", "") + ("'" * final_octave)
+            elif final_octave < 0:
+                mapped = mapped.replace("'", "").replace("_", "") + ("_" * abs(final_octave))
+                
+            results.append((mapped, token))
+            prev_idx = base_idx
+        else:
+            # Mode 3: Syllables -> Scale order
+            idx = len(results)
+            octave_shift = idx // len(swara_types)
+            base_pos = idx % len(swara_types)
+            mapped = swara_types[base_pos]
+            if octave_shift > 0:
+                mapped += "'" * octave_shift
+            results.append((mapped, token))
+            prev_idx = -1 # Reset state on unknown syllable
+            
+    return results
+
+def swara_to_keyboard(swara: str, freq: float, sa_freq: float, pitch_name: str) -> str:
+    """
+    Fix 3: Map swara to keyboard note using Just Intonation and semitone rounding.
+    """
+    CHROMATIC = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+    try:
+        # sa_idx = CHROMATIC.findIndex matching pitch_name exactly
+        sa_idx = CHROMATIC.index(pitch_name.upper())
+    except ValueError:
+        sa_idx = 0
+        
+    # Semitone calculation: round(12 * log2(freq / sa_freq))
+    semitones = round(12 * math.log2(freq / sa_freq))
+    
+    keyboard_idx = (sa_idx + semitones) % 12
+    return CHROMATIC[keyboard_idx]
 
 @app.get("/ragams")
 def get_ragams():
+    """Returns list of all available ragam names."""
     return list(RAGAM_DB.keys())
 
 @app.get("/talams")
 def get_talams():
+    """Returns list of all available talam names."""
     return list(TALAM_DB.keys())
 
+@app.get("/ragam_info/{ragam_name}")
+def get_ragam_info(ragam_name: str):
+    """Returns detailed info for a specific ragam."""
+    if ragam_name not in RAGAM_DB:
+        raise HTTPException(status_code=404, detail="Ragam not found")
+    return RAGAM_DB[ragam_name]
+
 @app.post("/generate")
-def generate_song(req: GenerationRequest, user: dict = Depends(get_current_user)):
+def generate_music(req: GenerationRequest, user: dict = Depends(get_current_user)):
+    """
+    Main entry point for generating authentic Carnatic music.
+    Supports Sarali Varisai patterns and 3-mode syllable/notation parsing.
+    """
     if req.ragam not in RAGAM_DB:
-        raise HTTPException(status_code=404, detail="Ragam not found")
+        raise HTTPException(status_code=404, detail=f"Ragam {req.ragam} not found.")
     
-    ragam_data = RAGAM_DB[req.ragam]
-    # Simple syllabification: split by spaces and hyphens
-    syllables = req.lyrics.replace("-", " ").split()
-    
-    # 1. Generate Melody Sequence
-    # Strategy: Linear walk through Arohanam then Avarohanam, repeating if necessary
-    scale = ragam_data["arohanam"] + ragam_data["avarohanam"][1:-1] # Avoid repeating S' and S
-    
-    melody_swaras = []
-    for i, _ in enumerate(syllables):
-        swara = scale[i % len(scale)]
-        melody_swaras.append(swara)
+    base_freq = PITCH_FREQ_MAP.get(req.pitch_name.upper(), DEFAULT_BASE_FREQ)
+    beat_dur = 60.0 / max(req.tempo, 1)
 
-    # 2. Apply Talam for Rhythm (Durations)
-    if req.talam not in TALAM_DB:
-        talam_pattern = [1] * 8 # Default
+    # 1. Determine Swara Sequence
+    if req.use_sarali:
+        swara_sequence = get_sarali_varisai(req.sarali_index, req.ragam)
+        syllables = [s.replace("'", "").replace("_", "") for s in swara_sequence]
+    elif req.lyrics:
+        # Fix 1: Multi-mode parser
+        parsed = parse_lyrics_to_swaras(req.lyrics, req.ragam)
+        swara_sequence = [p[0] for p in parsed]
+        syllables = [p[1] for p in parsed]
     else:
-        talam_pattern = TALAM_DB[req.talam]
-        
-    # Map swaras to talam beats. 
-    # If patterns run out, repeat.
+        # Default to full ascent/descent if no lyrics
+        swara_sequence = generate_full_ascent_descent(req.ragam)
+        syllables = [s.replace("'", "").replace("_", "") for s in swara_sequence]
+
+    # 2. Validation
+    if not ragam_validation(swara_sequence, req.ragam):
+        raise HTTPException(status_code=400, detail="Melody failed ragam validation.")
+
+    # 3. DSP Synthesis
     notes = []
-    notation_display = []
-    
-    base_beat_duration = 0.5 # seconds
-    
-    for i, (syl, swara) in enumerate(zip(syllables, melody_swaras)):
-        beat_idx = i % len(talam_pattern)
-        is_strong = talam_pattern[beat_idx] == 1
-        
-        # Simple rhythm: Strong beats = 1 sec, Weak = 0.5 sec? 
-        # Or standard duration, usually Talam defines structure, not individual note duration.
-        # Let's map 1 syllable = 1 beat for simplicity.
-        duration = base_beat_duration
-        
-        freq = get_freq(swara, base_freq=req.pitch)
-        
-        # Apply random gamaka if style is selected, else specific
-        # We apply user selection to random notes to simulate "style"
-        # Voice is cleaner without heavy gamaka usually in beginner lessons, but let's allow it.
-        applied_gamaka = None
-        if req.gamaka_style != "None":
-            if random.random() > 0.6: # 40% chance of gamaka on any note
-                applied_gamaka = req.gamaka_style
-        
-        notes.append(Note(freq, duration, applied_gamaka))
-        notation_display.append({
-            "lyric": syl,
-            "swara": swara,
-            "duration": duration,
-            "gamaka": applied_gamaka
+    display_notation = []
+    n_total = len(swara_sequence)
+
+    for i, s in enumerate(swara_sequence):
+        freq = get_freq(s, base_freq, req.ragam)
+        lyric = syllables[i] if i < len(syllables) else ""
+
+        # Extract clean swara type (strip octave markers) for gamaka decision
+        clean_swara = s.replace("'", "").replace("_", "")
+
+        notes.append(Note(
+            freq=freq,
+            duration=beat_dur,
+            swara_type=clean_swara,
+            is_last=(i == n_total - 1),
+        ))
+        display_notation.append({
+            "swara": s,
+            "keyboard_note": swara_to_keyboard(s, freq, base_freq, req.pitch_name),
+            "lyric": lyric,
+            "freq_hz": round(freq, 2),
+            "duration": round(beat_dur, 2)
         })
-        
-    # Generate Audio
-    if req.instrument == "Voice":
-        from .audio_engine import FormantSynthesizer
-        synth = FormantSynthesizer()
-        wav_io = synth.generate_melody(notes, lyrics=syllables)
-    else:
-        synth = ViolinSynthesizer()
-        wav_io = synth.generate_melody(notes)
-    
-    import base64
-    audio_b64 = base64.b64encode(wav_io.read()).decode('utf-8')
-    
+
+    synth = CarnaticSynthesizer(
+        instrument=req.instrument, 
+        talam=req.talam or "Adi", 
+        sa_freq=base_freq,
+        use_rhythm=False
+    )
+    wav_stream = synth.synthesize_melody(notes)
+
     return {
-        "notation": notation_display,
-        "audio_base64": audio_b64
+        "ragam": req.ragam,
+        "pitch_name": req.pitch_name,
+        "pitch_hz": base_freq,
+        "tempo": req.tempo,
+        "instrument": req.instrument,
+        "notation": display_notation,
+        "audio_base64": base64.b64encode(wav_stream.read()).decode("utf-8")
     }
 
-from fastapi import UploadFile, File, Form
+@app.get("/validate_system")
+def validate_system():
+    """Self-check for pitch and frequency accuracy (Octave 3 low register)."""
+    c_ok = pitch_validation("C", 130.81)
+    s_freq = get_freq("S", 130.81, "Mayamalavagowla")
+    tara_s_freq = get_freq("S'", 130.81, "Mayamalavagowla")
 
-@app.post("/train_voice")
-async def train_voice(
-    pitch: float = Form(...),
-    file: UploadFile = File(...),
-    user: dict = Depends(get_current_user)
-):
-    # Simulate processing time
-    import time
-    time.sleep(2) # Fake "training" time
-    
     return {
-        "status": "success",
-        "message": f"Voice profile calibrated for Scale {pitch} Hz.",
-        "profile_id": "profile_678"
-    }
-
-@app.post("/generate_with_audio")
-async def generate_with_audio(
-    lyrics: str = Form(...),
-    ragam: str = Form(...),
-    talam: str = Form(...),
-    gamaka_style: str = Form(...),
-    instrument: str = Form("Violin"),
-    pitch: float = Form(261.63),
-    file: UploadFile = File(None),
-    user: dict = Depends(get_current_user)
-):
-    req = GenerationRequest(lyrics=lyrics, ragam=ragam, talam=talam, gamaka_style=gamaka_style, instrument=instrument, pitch=pitch)
-    
-    # ... (Copy logic from previous generate_song)
-    if req.ragam not in RAGAM_DB:
-        raise HTTPException(status_code=404, detail="Ragam not found")
-    
-    ragam_data = RAGAM_DB[req.ragam]
-    syllables = req.lyrics.replace("-", " ").split()
-    scale = ragam_data["arohanam"] + ragam_data["avarohanam"][1:-1]
-    
-    # Helper to find valid swara in Ragam
-    def get_ragam_swara(base_char, ragam_scale):
-        # ragam_scale is boolean combined list.
-        # Find R1/R2/R3 in the list if base_char is 'R'
-        for s in ragam_scale:
-            if s.startswith(base_char):
-                return s
-        # Fallback if not found (e.g. Varja ragam missing a note) - return closest or Pa/Sa
-        if base_char == 'P': return 'P'
-        return 'S'
-
-    melody_swaras = []
-    
-    # Pre-compute unique swaras in this ragam for lookup
-    unique_swaras = set(scale)
-    
-    # Swara mapping for input detection
-    input_map = {
-        "sa": "S", "s": "S",
-        "ri": "R", "r": "R",
-        "ga": "G", "g": "G",
-        "ma": "M", "m": "M",
-        "pa": "P", "p": "P",
-        "da": "D", "da": "D", "dha": "D", "d": "D",
-        "ni": "N", "n": "N"
-    }
-
-    scale_index = 0
-    for i, syl in enumerate(syllables):
-        # Clean syllable to check if it's a swara
-        clean = syl.lower().strip().replace("aa", "a").replace("ee", "i")
-        
-        # Check if user typed a specific swara
-        base_swara = None
-        for k, v in input_map.items():
-            if clean == k:
-                base_swara = v
-                break
-        
-        if base_swara:
-            # User wants a specific note (e.g. "Ri")
-            # We must find WHICH Ri is allowed in this Ragam.
-            # We search the unique_swaras set.
-            found = False
-            for valid_s in unique_swaras:
-                if valid_s.startswith(base_swara): # matches R1, R2...
-                    melody_swaras.append(valid_s)
-                    found = True
-                    break
-            if not found:
-                 # Ragam doesn't have this note (e.g. Mohanam has no Ma)
-                 # Fallback: Just play Sa or keep previous?
-                 # Let's play next in scale to keep flow
-                 swara = scale[scale_index % len(scale)]
-                 melody_swaras.append(swara)
-                 scale_index += 1
-        else:
-            # Random text -> Generate melody based on scale walk
-            swara = scale[scale_index % len(scale)]
-            melody_swaras.append(swara)
-            scale_index += 1
-
-    if req.talam not in TALAM_DB:
-        talam_pattern = [1] * 8
-    else:
-        talam_pattern = TALAM_DB[req.talam]
-        
-    notes = []
-    notation_display = []
-    base_beat_duration = 0.5
-    
-    scale_index = 0
-    # For random wolk, we prefer a linear pitch space to move up/down
-    # We'll use Arohanam repeatedly or construct a 2-octave map if possible.
-    # For simplicity, let's use the combined scale we already have but treat it as valid notes
-    # Valid notes for random access:
-    valid_notes = sorted(list(set(scale)), key=lambda x: get_freq(x, base_freq=req.pitch))
-    # Reset index to middle
-    current_note_idx = 0 
-    
-    for i, syl in enumerate(syllables):
-        # Clean syllable to check if it's a swara
-        clean = syl.lower().strip().replace("aa", "a").replace("ee", "i")
-        
-        # Check if user typed a specific swara
-        input_map = {
-            "sa": "S", "s": "S",
-            "ri": "R", "r": "R", "re": "R",
-            "ga": "G", "g": "G",
-            "ma": "M", "m": "M",
-            "pa": "P", "p": "P",
-            "da": "D", "da": "D", "dha": "D", "d": "D",
-            "ni": "N", "n": "N"
+        "status": "healthy",
+        "pitch_calibration": "C3 @ 130.81 Hz" if c_ok else "ERR",
+        "math_check": {
+            "S":             s_freq,
+            "Tara_S_Target": 261.62,
+            "Tara_S_Actual": tara_s_freq,
+            "Tara_S_Valid":  abs(tara_s_freq - 261.62) < 0.05
         }
-        
-        base_swara = None
-        for k, v in input_map.items():
-            if clean == k:
-                base_swara = v
-                break
-        
-        swara = ""
-        duration = 0.5 # Default short
-        
-        # 1. Determine Rhythm (Duration) input heuristics
-        # If syllable has double vowels or is long, make it a Long beat (1.0s) or aligned to Talam
-        # Simple heuristic: 'aa', 'ee', 'oo', 'ii' or Length > 3
-        if "aa" in syl.lower() or "ee" in syl.lower() or "oo" in syl.lower() or "ii" in syl.lower() or len(syl) > 4:
-            duration = 1.0
-        
-        # 2. Determine Pitch (Swara)
-        if base_swara:
-            # Explicit Swara Mode
-            unique_swaras = set(scale)
-            found = False
-            for valid_s in unique_swaras:
-                if valid_s.startswith(base_swara): 
-                    swara = valid_s
-                    found = True
-                    break
-            if not found:
-                 swara = valid_notes[current_note_idx % len(valid_notes)]
-            
-            # Update current index to this explicit note to smooth transitions
-            try:
-                current_note_idx = valid_notes.index(swara)
-            except:
-                pass
-                
-        else:
-            # Generative "Song" Mode (Random Walk)
-            # biased random walk: stay(20%), +/-1(50%), +/-2(30%)
-            step = random.choices([0, 1, -1, 2, -2], weights=[20, 30, 30, 10, 10])[0]
-            current_note_idx += step
-            
-            # Bounds check (bounce)
-            if current_note_idx < 0:
-                current_note_idx = 1
-            if current_note_idx >= len(valid_notes):
-                current_note_idx = len(valid_notes) - 2
-                
-            swara = valid_notes[current_note_idx]
-
-        # Apply Talam override? 
-        # Talam dictates the grid. Duration should fit the grid.
-        # But for "Singing", duration is lyrical. 
-        # Let's keep lyrical duration but display Talam Beat Index.
-        
-        beat_idx = i % len(talam_pattern)
-        is_strong = talam_pattern[beat_idx] == 1
-        
-        freq = get_freq(swara, base_freq=req.pitch)
-        
-        applied_gamaka = None
-        if req.gamaka_style != "None":
-            # Higher chance of gamaka on long notes
-            chance = 0.8 if duration > 0.6 else 0.3
-            if random.random() < chance: 
-                applied_gamaka = req.gamaka_style
-        
-        notes.append(Note(freq, duration, applied_gamaka))
-        notation_display.append({
-            "lyric": syl,
-            "swara": swara,
-            "duration": duration,
-            "gamaka": applied_gamaka
-        })
-        
-    # Generate Audio
-    if req.instrument == "Voice":
-        from .audio_engine import FormantSynthesizer
-        synth = FormantSynthesizer()
-        wav_io = synth.generate_melody(notes, lyrics=syllables)
-    elif req.instrument == "MyVoice" and file:
-        from .audio_engine import SamplerSynthesizer
-        # Save temp file
-        import tempfile
-        import os
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-            tmp.write(await file.read())
-            tmp_path = tmp.name
-        
-        try:
-            # Assume user sings at ~C4 (261Hz)
-            synth = SamplerSynthesizer(tmp_path, base_freq=261.63)
-            wav_io = synth.generate_melody(notes)
-        finally:
-            os.remove(tmp_path)
-    else:
-        synth = ViolinSynthesizer()
-        wav_io = synth.generate_melody(notes)
-    
-    import base64
-    audio_b64 = base64.b64encode(wav_io.read()).decode('utf-8')
-    
-    return {
-        "notation": notation_display,
-        "audio_base64": audio_b64
     }
